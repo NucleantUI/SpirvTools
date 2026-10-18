@@ -1,0 +1,233 @@
+# Releases SpirvTools, run by hand with the version to release:
+#
+#   1. check     the version is X.Y.Z, and the run is on master;
+#   2. build     builds SPIRV-Tools from source on a Mac
+#                (scripts/build_spirv_tools.py) and tests the package against
+#                it; the archive, CSpirvTools.xcframework.zip, as an artifact;
+#   3. release   makes the release commit on top of master, the commit it ran
+#                on: Package.swift's `releasedCSpirvTools` filled in with the
+#                archive's URL on this release and its checksum (from
+#                `swift package compute-checksum`, which a url binary target
+#                must carry). Then tags it with the version, publishes the
+#                GitHub release with the archive, and pushes the commit to
+#                master — last, so master never names an archive that is not
+#                up yet. A version already released is re-released: its
+#                release and tag are replaced — only now, with everything
+#                built, tested and checked;
+#   4. verify    a new package that depends on the release by its version,
+#                built and run on macOS (SPIRV-Tools linked in) and on Linux
+#                (no SPIRV-Tools yet: it must still build, and say so when
+#                used).
+#
+# The tag and master are pushed with GITHUB_TOKEN, so they start no workflow.
+
+name: release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version to release, X.Y.Z (the tag)
+        type: string
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  TAG: ${{ inputs.version }}
+  SWIFT_VERSION: 6.3.3
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Version
+        run: |
+          semver='^[0-9]+\.[0-9]+\.[0-9]+$'
+          [[ "$TAG" =~ $semver ]] || { echo "::error::version $TAG is not X.Y.Z"; exit 1; }
+          # The release commit goes onto master.
+          [ "$GITHUB_REF" = refs/heads/master ] || { echo "::error::run it on master, not $GITHUB_REF"; exit 1; }
+          if git ls-remote --exit-code --tags "https://github.com/$GITHUB_REPOSITORY" "refs/tags/$TAG" >/dev/null; then
+            echo "::notice::$TAG is released already: it will be re-released"
+          fi
+
+  build:
+    needs: check
+    runs-on: macos-15
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7
+      # setup-uv publishes immutable releases without a moving major tag.
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+      - run: brew install ninja
+      - name: Build SPIRV-Tools
+        run: uv run scripts/build_spirv_tools.py
+      - uses: actions/upload-artifact@v7
+        with:
+          name: cspirvtools
+          path: Artifacts/CSpirvTools.xcframework.zip
+      - name: Install Swift ${{ env.SWIFT_VERSION }}
+        run: |
+          release="swift-${SWIFT_VERSION}-RELEASE"
+          curl -fsSLO "https://download.swift.org/swift-${SWIFT_VERSION}-release/xcode/${release}/${release}-osx.pkg"
+          installer -pkg "${release}-osx.pkg" -target CurrentUserHomeDirectory
+          echo "$HOME/Library/Developer/Toolchains/${release}.xctoolchain/usr/bin" >> "$GITHUB_PATH"
+      - name: Test against it
+        run: SPIRV_TOOLS_ARTIFACTS=1 swift test
+
+  release:
+    needs: build
+    runs-on: macos-15
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: cspirvtools
+          path: dist
+      - name: Install Swift ${{ env.SWIFT_VERSION }}
+        run: |
+          release="swift-${SWIFT_VERSION}-RELEASE"
+          curl -fsSLO "https://download.swift.org/swift-${SWIFT_VERSION}-release/xcode/${release}/${release}-osx.pkg"
+          installer -pkg "${release}-osx.pkg" -target CurrentUserHomeDirectory
+          echo "$HOME/Library/Developer/Toolchains/${release}.xctoolchain/usr/bin" >> "$GITHUB_PATH"
+      - name: Release commit
+        run: |
+          [ -f dist/CSpirvTools.xcframework.zip ] || { echo "::error::no CSpirvTools.xcframework.zip"; exit 1; }
+          checksum=$(swift package compute-checksum dist/CSpirvTools.xcframework.zip)
+          url="https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/CSpirvTools.xcframework.zip"
+          URL="$url" CHECKSUM="$checksum" python3 - <<'EOF'
+          import os, pathlib, re
+
+          manifest = pathlib.Path("Package.swift")
+          text = manifest.read_text()
+          # The previous release's entry, or nil before the first.
+          declaration = re.compile(
+              r"let releasedCSpirvTools: \(url: String, checksum: String\)\? = (nil|\(\n.*?\n\))\n", re.DOTALL)
+          assert len(declaration.findall(text)) == 1, "Package.swift has no releasedCSpirvTools to fill in"
+          entry = (
+              "let releasedCSpirvTools: (url: String, checksum: String)? = (\n"
+              f'    url: "{os.environ["URL"]}",\n'
+              f'    checksum: "{os.environ["CHECKSUM"]}"\n'
+              ")\n"
+          )
+          manifest.write_text(declaration.sub(lambda _: entry, text))
+          EOF
+          git diff Package.swift
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Package.swift
+          git commit -q -m "Release $TAG: SPIRV-Tools from the release's archive"
+      # The manifest as a consumer evaluates it: on macOS the binary target
+      # is this release's archive; for a wasm or Android build there is none.
+      - name: Release manifest
+        run: |
+          swift package dump-package > macos.json
+          WASM_BUILD=1 swift package dump-package > wasm.json
+          python3 - <<'EOF'
+          import json, os
+          url = f"https://github.com/{os.environ['GITHUB_REPOSITORY']}/releases/download/{os.environ['TAG']}/CSpirvTools.xcframework.zip"
+          for name in ("macos", "wasm"):
+              manifest = json.load(open(f"{name}.json"))
+              assert "unsafeFlags" not in json.dumps(manifest["targets"]), f"{name}: the release manifest has unsafeFlags"
+              assert not manifest["dependencies"], f"{name}: SpirvTools depends on nothing"
+              binaries = [t for t in manifest["targets"] if t["type"] == "binary"]
+              if name == "macos":
+                  assert len(binaries) == 1 and binaries[0].get("url") == url and binaries[0].get("checksum"), \
+                      f"macos: the binary target is not this release's archive: {binaries}"
+              else:
+                  assert not binaries, f"{name}: a binary target where SPIRV-Tools is not built: {binaries}"
+              print(f"{name}: " + (", ".join(t["url"] for t in binaries) or "no binary target"))
+          EOF
+          rm *.json
+      - name: Tag and publish
+        run: |
+          # Master as the run found it: the release commit goes on top of it,
+          # so nothing is replaced or published if it moved meanwhile.
+          git fetch -q origin master
+          [ "$(git rev-parse origin/master)" = "$GITHUB_SHA" ] || {
+            echo "::error::master moved during the run: run the release again on the new master"; exit 1; }
+          # A re-release replaces the version's release and tag.
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release delete "$TAG" --yes --cleanup-tag
+          fi
+          git tag "$TAG"
+          git push --force origin "refs/tags/$TAG"
+          # A draft until the archive is up, so nobody resolves a release
+          # that is missing it.
+          gh release create "$TAG" dist/CSpirvTools.xcframework.zip --verify-tag --draft --title "$TAG" \
+            --notes "SPIRV-Tools prebuilt for macOS (arm64 + x86_64): static libraries and the C API."
+          gh release edit "$TAG" --draft=false
+          # Master builds from this release from now on.
+          git push origin HEAD:refs/heads/master
+
+  verify:
+    needs: release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: macos, runner: macos-15, container: "" }
+          - { os: linux, runner: ubuntu-24.04, container: "swift:6.3.3-noble" }
+    runs-on: ${{ matrix.runner }}
+    container: ${{ matrix.container }}
+    steps:
+      - name: Install Swift ${{ env.SWIFT_VERSION }}
+        if: matrix.os == 'macos'
+        run: |
+          release="swift-${SWIFT_VERSION}-RELEASE"
+          curl -fsSLO "https://download.swift.org/swift-${SWIFT_VERSION}-release/xcode/${release}/${release}-osx.pkg"
+          installer -pkg "${release}-osx.pkg" -target CurrentUserHomeDirectory
+          echo "$HOME/Library/Developer/Toolchains/${release}.xctoolchain/usr/bin" >> "$GITHUB_PATH"
+      - name: Build a package that depends on the release
+        run: |
+          mkdir -p consumer/Sources/Consumer && cd consumer
+          cat > Package.swift <<EOF
+          // swift-tools-version: 6.1
+          import PackageDescription
+
+          let package = Package(
+              name: "Consumer",
+              platforms: [.macOS(.v14)],
+              dependencies: [
+                  .package(url: "https://github.com/$GITHUB_REPOSITORY", exact: "$TAG"),
+              ],
+              targets: [
+                  .executableTarget(name: "Consumer", dependencies: [
+                      .product(name: "SpirvTools", package: "SpirvTools"),
+                  ]),
+              ]
+          )
+          EOF
+          cat > Sources/Consumer/main.swift <<'EOF'
+          import SpirvTools
+
+          let tools = SpirvContext()
+          do {
+              let words = try tools.assemble("""
+                  OpCapability Shader
+                  OpMemoryModel Logical GLSL450
+                  OpEntryPoint GLCompute %main "main"
+                  OpExecutionMode %main LocalSize 1 1 1
+                  %void = OpTypeVoid
+                  %fn = OpTypeFunction %void
+                  %main = OpFunction %void None %fn
+                  %entry = OpLabel
+                  OpReturn
+                  OpFunctionEnd
+                  """)
+              if let error = tools.validate(words) { fatalError("\(error)") }
+              print("SPIRV-Tools \(SpirvContext.version): assembled and validated \(words.count) words")
+          } catch {
+              #if os(macOS)
+              fatalError("\(error)")
+              #else
+              print("built without SPIRV-Tools, as expected here: \(error)")
+              #endif
+          }
+          EOF
+          swift build
+          swift run Consumer

@@ -22,7 +22,10 @@ let buildsForMac: Bool = {
 /// checksum. Written here by .github/workflows/release.yml, which commits it
 /// to master with the release, so master and the release's tag build from
 /// the same archive. nil only before the first release.
-let releasedCSpirvTools: (url: String, checksum: String)? = nil
+let releasedCSpirvTools: (url: String, checksum: String)? = (
+    url: "https://github.com/NucleantUI/SpirvTools/releases/download/0.0.1/CSpirvTools.xcframework.zip",
+    checksum: "174e598ffde2e0c466b70d5505b22b6484318aa76ef04e237f1a083365326a5c"
+)
 
 /// SPIRV-Tools' static libraries and C API (spirv-tools/libspirv.h), as the
 /// "CSpirvTools" binary target:
